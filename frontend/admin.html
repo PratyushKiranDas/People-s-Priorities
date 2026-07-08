@@ -32,6 +32,7 @@
       --triage-quick: #0369a1;
       --triage-urgent:#b91c1c;
       --triage-long:  #6d28d9;
+      --triage-emergency: #dc2626;
       --admin-accent: #1e3a5f;
       font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
       color-scheme: light;
@@ -401,6 +402,7 @@
     .tab-btn.active { color: var(--brand); border-bottom-color: var(--brand); background: none; box-shadow: none; }
     .tab-btn[data-tab="urgent_infrastructure"].active { color: var(--triage-urgent); border-bottom-color: var(--triage-urgent); }
     .tab-btn[data-tab="long_term_planning"].active    { color: var(--triage-long);   border-bottom-color: var(--triage-long); }
+    .tab-btn[data-tab="critical_emergency"].active    { color: var(--triage-emergency); border-bottom-color: var(--triage-emergency); }
 
     .tab-count {
       background: var(--line-soft);
@@ -673,6 +675,9 @@
         </div>
         <div style="border-bottom: 2px solid var(--line);">
           <div class="tab-bar" id="priority-tab-bar" role="tablist">
+            <button class="tab-btn" data-tab="critical_emergency" role="tab">
+              🆘 Emergencies <span class="tab-count" id="ptab-count-critical_emergency">0</span>
+            </button>
             <button class="tab-btn active" data-tab="quick_fix" role="tab">
               ⚡ Quick <span class="tab-count" id="ptab-count-quick_fix">0</span>
             </button>
@@ -700,6 +705,9 @@
         <!-- Triage tabs for submissions -->
         <div style="border-bottom: 2px solid var(--line);">
           <div class="tab-bar" id="submission-tab-bar" role="tablist">
+            <button class="tab-btn" data-tab="critical_emergency" role="tab">
+              🆘 Emergencies <span class="tab-count" id="stab-count-critical_emergency">0</span>
+            </button>
             <button class="tab-btn active" data-tab="quick_fix" role="tab">
               ⚡ Quick Fixes <span class="tab-count" id="stab-count-quick_fix">0</span>
             </button>
@@ -770,15 +778,16 @@
   }
 
   function urgencyOf(item) {
-    return Number(item.urgency_score ?? item.analysis?.urgency_score ?? 1) || 1;
+    const score = Number(item.urgency_score ?? item.analysis?.urgency_score ?? 1) || 1;
+    return score.toFixed(1);
   }
 
   function triageLabel(t) {
-    return { quick_fix: "⚡ Quick Fix", urgent_infrastructure: "🚨 Urgent", long_term_planning: "📐 Long-Term" }[t] || t;
+    return { critical_emergency: "🆘 EMERGENCY", quick_fix: "⚡ Quick Fix", urgent_infrastructure: "🚨 Urgent", long_term_planning: "📐 Long-Term" }[t] || t;
   }
 
   function triageColor(t) {
-    return { quick_fix: "var(--triage-quick)", urgent_infrastructure: "var(--triage-urgent)", long_term_planning: "var(--triage-long)" }[t] || "var(--muted)";
+    return { critical_emergency: "var(--triage-emergency)", quick_fix: "var(--triage-quick)", urgent_infrastructure: "var(--triage-urgent)", long_term_planning: "var(--triage-long)" }[t] || "var(--muted)";
   }
 
   /* ── Auth ───────────────────────────────────────────────────────────────── */
@@ -835,17 +844,22 @@
       priorityList.innerHTML = `<div class="meta" style="padding:8px">No priorities in this category.</div>`;
       return;
     }
-    priorityList.innerHTML = items.slice(0, 20).map((item, index) => `
-      <article class="priority-item">
+    priorityList.innerHTML = items.slice(0, 20).map((item, index) => {
+      const titleText = item.formal_description || item.latest_summary || "";
+      const displayTitle = titleText
+        ? titleText.substring(0, 50) + (titleText.length > 50 ? "…" : "")
+        : item.category || "General Issue";
+      return `
+      <article class="priority-item${item.triage_category === 'critical_emergency' ? ' emergency-item' : ''}">
         <div class="row">
-          <strong style="font-size:0.88rem">${index + 1}. ${escapeHtml(item.ward_name || item.ward_id)}</strong>
+          <strong style="font-size:0.88rem">${index + 1}. ${escapeHtml(displayTitle)}</strong>
           <span class="pill">${escapeHtml(item.category)}</span>
         </div>
         <div class="row meta">
           <span>
             ${escapeHtml(item.count)} issues
             ${item.total_reports > item.count
-              ? `<span class="cluster-badge">👥 ${escapeHtml(item.total_reports)}</span>`
+              ? ('<span class="cluster-badge">👥 ' + escapeHtml(item.total_reports) + '</span>')
               : ""}
           </span>
           <span class="urgency">${Number(item.demand_score || 0).toFixed(1)}/10</span>
@@ -854,16 +868,18 @@
           ${escapeHtml(item.latest_summary)}
         </div>
       </article>
-    `).join("");
+    `;
+    }).join("");
   }
 
   function renderPriorities(byTriage) {
     state.prioritiesByTriage = {
+      critical_emergency:    byTriage.critical_emergency || [],
       quick_fix:             byTriage.quick_fix || [],
       urgent_infrastructure: byTriage.urgent_infrastructure || [],
       long_term_planning:    byTriage.long_term_planning || [],
     };
-    for (const key of ["quick_fix", "urgent_infrastructure", "long_term_planning"]) {
+    for (const key of ["critical_emergency", "quick_fix", "urgent_infrastructure", "long_term_planning"]) {
       const el = $(`ptab-count-${key}`);
       if (el) el.textContent = (state.prioritiesByTriage[key] || []).length;
     }
@@ -890,7 +906,7 @@
   }
 
   function updateSubmissionTabCounts(submissions) {
-    for (const key of ["quick_fix", "urgent_infrastructure", "long_term_planning"]) {
+    for (const key of ["critical_emergency", "quick_fix", "urgent_infrastructure", "long_term_planning"]) {
       const count = submissions.filter((s) => (s.triage_category || "quick_fix") === key).length;
       const el = $(`stab-count-${key}`);
       if (el) el.textContent = count;
@@ -915,7 +931,8 @@
       const currentStatus = item.status || "Noticed by Government";
       const explanation   = item.mp_explanation || "";
       const triage        = item.triage_category || "quick_fix";
-      const summary       = item.formal_description || item.analysis?.summary || item.text || "Media submission";
+      const isEmergency   = triage === "critical_emergency";
+      const summary       = item.formal_description || "Media submission";
       const rawDescription = item.raw_description && item.raw_description !== summary
         ? item.raw_description
         : "";
@@ -939,11 +956,10 @@
         : "";
 
       const rawDescBlock = rawDescription ? `
-        <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
-          <span class="meta" style="font-size:0.78rem">Original:</span>
-          <button type="button" class="description-toggle" onclick="this.closest('.submission-item').querySelector('.raw-description-block').classList.toggle('open'); this.textContent = this.textContent === 'Show ▾' ? 'Hide ▴' : 'Show ▾'">Show ▾</button>
-        </div>
-        <div class="raw-description-block">${escapeHtml(rawDescription)}</div>
+        <details style="margin-top: 8px;">
+          <summary style="font-size:0.8rem; color:#777; cursor:pointer;">Show Original Citizen Input</summary>
+          <p style="font-style:italic; font-size:0.85rem; color:#555; background:#f9f9f9; padding:6px; border-radius:4px;">${escapeHtml(rawDescription)}</p>
+        </details>
       ` : "";
 
       // Linked citizens list (collapsed if many)
@@ -965,7 +981,8 @@
       ` : "";
 
       return `
-        <article class="submission-item" id="item-${escapeHtml(item.id)}">
+        <article class="submission-item${isEmergency ? ' emergency-item' : ''}" id="item-${escapeHtml(item.id)}">
+          ${isEmergency ? `<div style="background:var(--triage-emergency);color:#fff;border-radius:6px;padding:6px 12px;font-size:0.78rem;font-weight:800;letter-spacing:0.04em;display:flex;align-items:center;gap:8px;">🆘 CRITICAL EMERGENCY — Escalate Immediately</div>` : ""}
           ${photoThumb}
 
           <div class="row" style="flex-wrap:wrap;gap:6px">
@@ -976,7 +993,7 @@
               ${langBadge}
               ${profanityBadge}
             </div>
-            <span class="urgency">${urgencyOf(item)}/10</span>
+            <span class="urgency">${urgencyOf(item)}&nbsp;/&nbsp;10</span>
           </div>
 
           <div class="row">

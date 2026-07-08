@@ -803,8 +803,8 @@ async def ranked_priorities(
 
         bucket["count"] += 1
         bucket["total_reports"] += report_count
-        bucket["max_urgency"] = round(max(bucket["max_urgency"], effective_urgency), 2)
-        bucket["demand_score"] = round(max(bucket["demand_score"], demand_score), 2)
+        bucket["max_urgency"] = round(max(bucket["max_urgency"], effective_urgency), 1)
+        bucket["demand_score"] = round(max(bucket["demand_score"], demand_score), 1)
         bucket["latest_summary"] = (
             (item.get("analysis") or {}).get("summary")
             or item.get("formal_description")
@@ -826,6 +826,7 @@ async def ranked_priorities(
 
     # Build triage-grouped convenience dict for frontend tab rendering
     by_triage: Dict[str, List[Dict[str, Any]]] = {
+        "critical_emergency": [],
         "quick_fix": [],
         "urgent_infrastructure": [],
         "long_term_planning": [],

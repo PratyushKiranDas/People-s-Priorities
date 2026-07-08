@@ -21,7 +21,7 @@ Category = Literal[
     "safety", "electricity", "housing", "environment", "other",
 ]
 
-TriageCategory = Literal["quick_fix", "urgent_infrastructure", "long_term_planning"]
+TriageCategory = Literal["quick_fix", "urgent_infrastructure", "long_term_planning", "critical_emergency"]
 
 
 # ─── Pydantic Schemas ─────────────────────────────────────────────────────────
@@ -38,11 +38,11 @@ class FormalizationResult(BaseModel):
     """
     formal_description: str = Field(
         description=(
-            "A professional, formal English description of the civic issue. "
-            "ALL profanity and offensive language must be removed and replaced with "
+            "A professional, formal English translation and description of the civic issue. "
+            "You MUST translate everything into standard, formal English. "
+            "ALL profanity (e.g., 'sala', 'ch**iya') and offensive language MUST be completely stripped and replaced with "
             "neutral factual language. ALL slang, colloquialisms, abbreviations, and "
             "emotional overstatements must be converted to standard English. "
-            "ALL regional Indian languages must be translated to English. "
             "The factual civic complaint — location, problem type, severity — must be fully preserved."
         )
     )
@@ -108,21 +108,35 @@ class SubmissionAnalysis(BaseModel):
     category: Category
     triage_category: TriageCategory = Field(
         description=(
-            "Classify into exactly one of three triage buckets:\n"
-            "• quick_fix — Minor, fast-resolvable issues needing minimal budget and time "
-            "(potholes, broken streetlights, garbage collection, broken benches, "
-            "minor drainage blocks, missing road signs, damaged footpaths).\n"
-            "• urgent_infrastructure — Safety-critical or health-critical issues requiring "
-            "immediate escalation (bridge damage or collapse risk, hospital/clinic failures, "
-            "major power grid outages, sewage overflow into streets, severe flooding, "
-            "structural building collapse, water supply contamination).\n"
+            "Classify into exactly one of FOUR triage buckets (read all before deciding):\n"
+            "• critical_emergency — IMMEDIATE danger to human life or public safety. "
+            "Always assign urgency_score 9 or 10. Requires emergency services, police, or "
+            "immediate district-level escalation. "
+            "Examples: reported dead body, serious accident with injuries, building collapse, "
+            "fire, gas leak, explosion, people trapped, drowning, murder scene.\n"
+            "• urgent_infrastructure — Safety-critical or health-critical, needs same-day / "
+            "next-day escalation. Typically urgency 7–8. "
+            "Examples: bridge structural damage, hospital/clinic failure, major power outage, "
+            "sewage overflow on streets, severe flooding, water contamination.\n"
+            "• quick_fix — Minor, fast-resolvable issues needing routine maintenance. "
+            "Typically urgency 3–6. "
+            "Examples: potholes, broken streetlights, garbage collection, broken benches, "
+            "minor drainage blocks, missing road signs, damaged footpaths.\n"
             "• long_term_planning — Issues requiring formal planning, budget approval, "
-            "and multi-month execution (building new roads, schools, parks, community centers, "
-            "major drainage networks, new highways, public transit infrastructure, "
-            "large-scale electrification projects)."
+            "and multi-month execution. Typically urgency 1–5. "
+            "Examples: building new roads, schools, parks, community centers, "
+            "major drainage networks, new highways, public transit."
         )
     )
-    urgency_score: int = Field(ge=1, le=10, description="10 = imminent danger requiring immediate action.")
+    urgency_score: float = Field(
+        ge=1.0, le=10.0,
+        description=(
+            "MANDATORY: Assign a highly specific decimal float score (e.g., 3.4, 4.7, 7.2, 8.9). "
+            "INTEGER SCORES like 4.0, 5.0, or 6.0 are STRICTLY FORBIDDEN unless mathematically exact. "
+            "Calculate using deep granularity: public safety impact, population disruption, systemic scale. "
+            "NEVER default to 5.0. Use the calibration benchmarks above to anchor your reasoning."
+        ),
+    )
     sentiment: Literal["negative", "neutral", "positive"]
     suggested_department: str
     constituency_priority: str = Field(
@@ -194,35 +208,71 @@ Output ONLY the structured JSON. No preamble, no explanation.
 ANALYSIS_SYSTEM = """\
 You are an AI assistant for constituency development planning in India.
 
-Analyze citizen civic issue submissions (text and/or attached photos) and produce a complete structured analysis.
+Analyze citizen civic issue submissions and produce a complete structured analysis.
+You MUST use the full 1.0-10.0 urgency scale with decimal precision. DO NOT default to 5.0.
 
-═══ TRIAGE CATEGORIES — Assign exactly one ═══════════════════════════════════
-• quick_fix: Issues resolvable within days to a few weeks with routine budget allocation.
-  Examples: potholes, broken streetlights, overflowing garbage bins, broken benches,
-  blocked roadside drains, missing road signs, damaged footpaths, waterlogging on minor roads.
+=== URGENCY SCORE - CALIBRATION BENCHMARKS ===
 
-• urgent_infrastructure: Safety-critical or health-critical issues requiring immediate escalation.
-  Examples: damaged or unstable bridge, hospital/PHC closure or critical shortage,
-  major power grid failure (entire colony/ward), raw sewage overflow on streets,
-  severe flooding blocking access routes, structural building collapse risk,
-  drinking water contamination.
+Assign a PRECISE DECIMAL score (e.g., 8.5, 9.2, 3.7). Use these anchors:
 
-• long_term_planning: Issues requiring formal planning, budget sanction, and multi-month execution.
-  Examples: constructing a new road or highway, building a school or community center,
-  new public park, major drainage network installation, electrification of new areas,
-  public transit infrastructure, large water supply projects.
+- 1.0-2.0  MINOR NUISANCES: No real harm. Purely cosmetic or trivial.
+           Examples: overgrown grass on footpath, faded road markings, missing park bench.
 
-═══ URGENCY SCORING (1–10) ═══════════════════════════════════════════════════
-• 9–10: Imminent danger to human life or health. Hours matter.
-• 7–8:  Significant disruption, active safety risk. Days matter.
-• 5–6:  Moderate impact on daily life, needs action within weeks.
-• 3–4:  Low impact, inconvenience, can wait months.
-• 1–2:  Minor cosmetic or convenience issue with minimal impact.
+- 3.0-4.0  LOW-PRIORITY MAINTENANCE: Inconvenient, no safety risk.
+           Examples: small pothole on a side street, flickering streetlight in a well-lit area,
+           garbage not collected for 2-3 days, minor pavement crack.
 
-═══ LOCATION ═════════════════════════════════════════════════════════════════
-• If the citizen mentions a specific location, capture it in location_hint.
-• Only populate geocode coordinates if you have strong geographic knowledge.
-• Otherwise leave geocode null.
+- 5.0-6.0  STANDARD MAINTENANCE: Moderate impact. Timely action needed.
+           Examples: broken streetlight on a main road, multiple potholes, school washroom out
+           of service, blocked roadside drain.
+
+- 7.0-8.0  SERIOUS COMMUNITY IMPACT: Safety/health risk. Days matter.
+           Examples: water main broken (colony without supply), sewage overflow on street,
+           bridge with visible damage, hospital shortage, large pothole causing accidents.
+
+- 9.0-10.0 CRITICAL EMERGENCY: Immediate danger to life. Hours matter. ALWAYS score 9.0-10.0.
+           Examples: dead body reported, serious accident with injuries, building collapse,
+           structure about to fall, active fire, gas leak, explosion, people trapped.
+
+HARD RULES - NEVER violate:
+  - Death / dead body reported -> score MUST be 10.0, triage = critical_emergency.
+  - Collapse / fire / gas leak / explosion -> score MUST be 9.0+, triage = critical_emergency.
+  - DO NOT assign 5.0 as a default. Every score must reflect actual severity.
+  - Use decimal precision: e.g. 8.5 not 8, 3.7 not 4.
+
+=== TRIAGE CATEGORIES - Assign exactly one ===
+
+Read ALL four definitions carefully before assigning. Getting this wrong is a critical failure.
+
+- quick_fix: Minor, LOCALIZED maintenance items that need no new engineering plans or budget approvals.
+  Score typically 2.5-5.5.
+  Examples: potholes, trash pile on a street, broken streetlight, clogged roadside drain,
+  damaged footpath, missing road sign, broken bench, localized cleaning needed.
+  KEY RULE: The problem already EXISTS. It just needs to be REPAIRED or CLEANED.
+
+- urgent_infrastructure: Major utility or structural FAILURES disrupting services for many citizens.
+  NOT immediately life-threatening, but causing significant public harm. Score typically 6.5-8.5.
+  Examples: burst water main cutting supply to colony, local grid failure (blackout),
+  broken sewer line with overflow, severe street flooding blocking access,
+  structural damage to an existing bridge (not collapse), hospital supply shortage.
+  KEY RULE: An EXISTING asset/service has FAILED and is harming many people.
+
+- long_term_planning: ANY request to CREATE a NEW civic asset or large engineering project.
+  Score typically 2.0-5.5.
+  KEY RULE: If someone is asking to BUILD or CREATE something that does NOT currently exist,
+  it is ALWAYS long_term_planning, regardless of how urgently they phrase it.
+  Examples: "need a new college", "build a hospital", "construct a flyover/bridge",
+  "establish a new park", "create a community center", "want a new road to be built",
+  "we need a university in our area", "our town needs a bus depot".
+
+- critical_emergency: IMMEDIATE, active threats to human life. Score 9.0-10.0.
+  Requires emergency services (police, ambulance, fire brigade) right now.
+  Examples: dead body found, building collapse in progress, serious accident with casualties,
+  active fire, gas leak/explosion, people trapped under debris, drowning victim.
+
+=== LOCATION ===
+- Capture specific location in location_hint if mentioned by citizen.
+- Only populate geocode if you have strong geographic knowledge. Otherwise null.
 
 Output ONLY the structured JSON. No preamble.
 """
@@ -303,18 +353,22 @@ def formalize_submission(
     model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     prompt = (
-        "Process the following raw citizen complaint and return a formalized version.\n\n"
+        "You are a strict, professional translator and civic editor for an Indian government portal.\n\n"
+        "TASK: Convert the raw citizen input below into a clean, formal, government-record-ready English description.\n\n"
         "RAW CITIZEN INPUT:\n"
         "'''\n"
         f"{raw_text or '[No text provided. Analyze the civic issue shown in the attached photo/media and describe it formally.]'}\n"
         "'''\n\n"
-        "Apply ALL formalization rules:\n"
-        "1. Translate to English if in a regional language\n"
-        "2. Remove all profanity and offensive language (replace with neutral civic language)\n"
-        "3. Convert slang and transliteration to professional English\n"
-        "4. Preserve all factual civic details (location, problem, severity)\n"
-        "5. Detect and report the original language code\n"
-        "6. Set profanity_detected appropriately\n"
+        "STRICT MANDATORY RULES — violating any of these is unacceptable:\n"
+        "1. TRANSLATE: ALL Indian regional languages (Hindi, Bengali, Tamil, Telugu, Marathi, Punjabi, Gujarati, Malayalam, Kannada, Odia, Urdu, Assamese, Bhojpuri, Rajasthani) "
+           "and ALL transliterations (Hinglish, Banglish, Tanglish, Roman-script regional text) MUST be translated into formal English. "
+           "The output formal_description MUST be entirely in English.\n"
+        "2. SCRUB PROFANITY: Completely remove ALL slang, colloquialisms, abusive terms, and profanities (e.g., 'sala', 'bekar', 'faltu', 'ganda', 'bakwaas', 'ch**ya', 'haramkhor', 'madarchod' and equivalents in any language). "
+           "Replace with neutral, objective civic descriptions. The formal_description MUST NOT contain any of the original slang or profanity.\n"
+        "3. PRESERVE FACTS: The factual civic complaint — location, problem type, severity, affected people — must be fully preserved and accurately described.\n"
+        "4. PROFESSIONAL TONE: Use formal, polite language appropriate for a government record. No emotional language, exaggerations, or first-person anger.\n"
+        "5. DETECT LANGUAGE: Report the ISO 639-1 code of the primary language in the original input.\n"
+        "6. FLAG PROFANITY: Set profanity_detected=true if ANY profanity, slang, or offensive language was present in the original.\n"
     )
 
     parts: List[types.Part] = [types.Part.from_text(text=prompt)]
@@ -333,7 +387,8 @@ def formalize_submission(
             ),
         )
         return _coerce_formalization(response)
-    except Exception:
+    except Exception as e:
+        print(f"CRITICAL GEMINI ERROR: {e}")
         # Graceful fallback: preserve raw text, mark as unprocessed
         summary = (raw_text.strip()[:160] if raw_text.strip()
                    else "A civic issue has been reported via submitted media.")
@@ -433,6 +488,7 @@ def check_deduplication(
         return result
 
     except Exception as exc:
+        print(f"CRITICAL GEMINI ERROR: {exc}")
         # Safety fallback: always treat as new issue — never silently drop a report
         return DeduplicationResult(
             is_duplicate=False,
@@ -448,47 +504,131 @@ def _local_fallback_analysis(text: str) -> Dict[str, Any]:
     """
     Keyword-based triage fallback when Gemini is unavailable.
     Activated only when ENABLE_LOCAL_AI_FALLBACK=true is set in .env.
+
+    Prints a loud WARNING to the terminal so operators can see the API is failing.
     """
+    print(
+        "\n" + "=" * 72 + "\n"
+        "WARNING: Gemini API failed — using local keyword fallback!\n"
+        "Check your GEMINI_API_KEY environment variable and network connectivity.\n"
+        "AI scores will be approximate. Fix the API key to restore precision.\n"
+        + "=" * 72 + "\n"
+    )
+
     lowered = text.lower()
     category: Category
     triage: TriageCategory
 
-    if any(w in lowered for w in ["sewage", "sewer", "sewage overflow", "open drain overflow"]):
-        category, triage = "sanitation", "urgent_infrastructure"
-    elif any(w in lowered for w in ["water", "pipeline", "tap", "leakage", "water supply"]):
-        category, triage = "water", "quick_fix"
-    elif any(w in lowered for w in ["garbage", "waste", "litter", "trash", "bins", "dump"]):
-        category, triage = "sanitation", "quick_fix"
-    elif any(w in lowered for w in ["pothole", "road surface", "broken road", "damaged road"]):
-        category, triage = "roads", "quick_fix"
-    elif any(w in lowered for w in ["bridge", "overpass", "flyover", "underpass"]):
-        category, triage = "roads", "urgent_infrastructure"
-    elif any(w in lowered for w in ["new road", "new highway", "road construction", "road building"]):
-        category, triage = "roads", "long_term_planning"
-    elif any(w in lowered for w in ["road", "traffic", "street", "footpath", "pavement"]):
-        category, triage = "roads", "quick_fix"
-    elif any(w in lowered for w in ["streetlight", "street light", "lamp post"]):
-        category, triage = "electricity", "quick_fix"
-    elif any(w in lowered for w in ["power cut", "blackout", "power failure", "electricity", "grid"]):
-        category, triage = "electricity", "urgent_infrastructure"
-    elif any(w in lowered for w in ["hospital", "clinic", "phc", "doctor", "health centre", "ambulance"]):
-        category, triage = "health", "urgent_infrastructure"
-    elif any(w in lowered for w in ["new school", "build school", "school construction"]):
-        category, triage = "education", "long_term_planning"
-    elif any(w in lowered for w in ["school", "teacher", "classroom", "college", "education"]):
-        category, triage = "education", "quick_fix"
-    elif any(w in lowered for w in ["park", "garden", "playground", "community centre"]):
-        category, triage = "environment", "long_term_planning"
-    elif any(w in lowered for w in ["flood", "waterlogging", "drainage"]):
-        category, triage = "water", "urgent_infrastructure"
-    else:
-        category, triage = "other", "quick_fix"
+    # ── CRITICAL EMERGENCY detection (MUST run first, highest priority) ──────
+    # Any of these keywords indicate an immediate danger to human life.
+    emergency_keywords = [
+        "dead body", "found dead", "dead man", "dead woman", "dead child",
+        "dead", "death", "died", "corpse", "body found",
+        "collapse", "collapsed", "collapsing", "building fell", "structure fell",
+        "accident", "road accident", "car crash", "vehicle crash", "bike crash",
+        "fire", "burning", "on fire",
+        "gas leak", "gas cylinder", "lpg leak",
+        "explosion", "blast",
+        "injured", "serious injury", "critical condition",
+        "drowning", "drowned",
+        "murder", "killed", "stabbed", "shot",
+        "trapped", "rescue needed", "missing person",
+        "electrocuted", "electric shock",
+    ]
+    if any(w in lowered for w in emergency_keywords):
+        summary = text.strip()[:180] or "Critical emergency reported."
+        print(
+            f"WARNING [fallback]: Emergency keyword detected in submission.\n"
+            f"  Text preview: \"{summary[:100]}\"\n"
+            f"  Assigning: triage=critical_emergency, urgency=10/10\n"
+        )
+        return SubmissionAnalysis(
+            summary=summary,
+            category="safety",
+            triage_category="critical_emergency",
+            urgency_score=10.0,
+            sentiment="negative",
+            suggested_department="Emergency Services / Police / District Magistrate",
+            constituency_priority=(
+                "CRITICAL EMERGENCY: Immediate life-threatening situation reported. "
+                "Requires emergency services and district-level escalation NOW."
+            ),
+            keywords=["emergency", "critical", "life-threatening", "immediate-action"],
+            location_hint=None,
+            geocode=None,
+            rationale=(
+                "Emergency keywords detected by local fallback analysis. "
+                "Escalated to maximum urgency. AI API was unavailable for full analysis."
+            ),
+        ).model_dump(mode="json")
 
-    urgent_words = ["urgent", "danger", "accident", "emergency", "collapse", "fire", "death",
-                    "bleeding", "critical", "explosion", "gas leak"]
-    urgency = 8 if any(w in lowered for w in urgent_words) else 5
-    if urgency >= 7 and triage == "quick_fix":
+    # ── Tier 1: long_term_planning — NEW asset creation keywords ────────
+    long_term_words = [
+        "college", "university", "build", "construct", "flyover",
+        "new bridge", "new hospital", "new school", "new road", "new park",
+        "establish", "create a", "need a new", "build a", "new clinic",
+        "new community", "new market", "bus depot", "metro", "new highway",
+        "new drainage", "new pipeline", "expand", "develop a",
+    ]
+    # ── Tier 2: urgent_infrastructure — existing service failures ────────
+    urgent_words = [
+        "burst pipe", "burst water", "flooding", "flood", "sewer",
+        "sewage overflow", "power grid", "blackout", "grid failure",
+        "power failure", "no water supply", "water contamination",
+        "structural damage", "damaged bridge", "hospital shortage",
+        "broken sewer", "no electricity", "transformer failure",
+    ]
+
+    # ── Standard keyword triage (Tier 1 > Tier 2 > Tier 3) ──────────────
+    if any(w in lowered for w in long_term_words):
+        # Determine best category for long-term request
+        if any(w in lowered for w in ["college", "university", "school", "classroom"]):
+            category = "education"
+        elif any(w in lowered for w in ["hospital", "clinic", "health"]):
+            category = "health"
+        elif any(w in lowered for w in ["bridge", "flyover", "road", "highway"]):
+            category = "roads"
+        elif any(w in lowered for w in ["park", "garden", "playground"]):
+            category = "environment"
+        else:
+            category = "other"
+        triage = "long_term_planning"
+        urgency = 3.2
+    elif any(w in lowered for w in urgent_words):
+        if any(w in lowered for w in ["water", "pipeline", "tap"]):
+            category = "water"
+        elif any(w in lowered for w in ["sewer", "sewage", "drainage"]):
+            category = "sanitation"
+        elif any(w in lowered for w in ["power", "electricity", "blackout", "grid"]):
+            category = "electricity"
+        elif any(w in lowered for w in ["bridge", "structural"]):
+            category = "roads"
+        elif any(w in lowered for w in ["hospital", "health"]):
+            category = "health"
+        else:
+            category = "other"
         triage = "urgent_infrastructure"
+        urgency = 7.8
+    elif any(w in lowered for w in ["sewage", "sewer"]):
+        category, triage, urgency = "sanitation", "urgent_infrastructure", 7.2
+    elif any(w in lowered for w in ["garbage", "waste", "litter", "trash", "dump"]):
+        category, triage, urgency = "sanitation", "quick_fix", 3.6
+    elif any(w in lowered for w in ["pothole", "road surface", "broken road", "damaged road"]):
+        category, triage, urgency = "roads", "quick_fix", 4.2
+    elif any(w in lowered for w in ["road", "traffic", "street", "footpath", "pavement"]):
+        category, triage, urgency = "roads", "quick_fix", 3.8
+    elif any(w in lowered for w in ["streetlight", "street light", "lamp post"]):
+        category, triage, urgency = "electricity", "quick_fix", 3.4
+    elif any(w in lowered for w in ["water", "pipeline", "tap", "leakage"]):
+        category, triage, urgency = "water", "quick_fix", 4.5
+    elif any(w in lowered for w in ["flood", "waterlogging"]):
+        category, triage, urgency = "water", "urgent_infrastructure", 7.4
+    elif any(w in lowered for w in ["school", "teacher", "classroom", "education"]):
+        category, triage, urgency = "education", "quick_fix", 4.8
+    elif any(w in lowered for w in ["park", "garden", "playground"]):
+        category, triage, urgency = "environment", "long_term_planning", 2.8
+    else:
+        category, triage, urgency = "other", "quick_fix", 3.9
 
     summary = text.strip()[:180] or "Citizen submitted a media-only civic issue."
     return SubmissionAnalysis(
@@ -499,10 +639,10 @@ def _local_fallback_analysis(text: str) -> Dict[str, Any]:
         sentiment="negative" if urgency >= 7 else "neutral",
         suggested_department="Constituency development office",
         constituency_priority="Requires triage against demographic vulnerability and citizen demand.",
-        keywords=[category, triage, "citizen-report"],
+        keywords=[category, triage, "citizen-report", "fallback-analysis"],
         location_hint=None,
         geocode=None,
-        rationale="Generated by local keyword fallback because Gemini was unavailable.",
+        rationale="Generated by local keyword fallback because Gemini was unavailable. Accuracy may be lower.",
     ).model_dump(mode="json")
 
 
@@ -547,7 +687,8 @@ def analyze_submission(
             ),
         )
         return _coerce_analysis(response)
-    except Exception:
+    except Exception as e:
+        print(f"CRITICAL GEMINI ERROR: {e}")
         if os.getenv("ENABLE_LOCAL_AI_FALLBACK", "false").lower() == "true":
             return _local_fallback_analysis(text)
         raise
