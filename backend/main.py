@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import mimetypes
 import json
 import os
@@ -17,6 +18,7 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -27,16 +29,28 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from ai_engine import analyze_submission, fetch_demographics_from_bigquery
+from ai_engine import (
+    analyze_submission,
+    check_deduplication,
+    fetch_demographics_from_bigquery,
+    formalize_submission,
+)
 
 load_dotenv()
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR.parent / "frontend"
 INDEX_HTML = FRONTEND_DIR / "index.html"
 SUBMISSIONS_FILE = BASE_DIR / "data" / "submissions.json"
-UPLOAD_DIR = BASE_DIR / "data" / "uploads"
+STATIC_DIR = BASE_DIR / "static"
+UPLOAD_DIR = STATIC_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+ADMIN_PASSKEY = "MP-2026"
 
 WORKFLOW_STATUSES = {
     "Noticed by Government",
@@ -45,22 +59,31 @@ WORKFLOW_STATUSES = {
     "Work Done",
 }
 
-SUBMISSION_DEFAULTS = {
+SUBMISSION_DEFAULTS: Dict[str, Any] = {
     "status": "Noticed by Government",
     "mp_explanation": "",
     "citizen_review": None,
     "is_archived": False,
+    "linked_reports": [],
+    "report_count": 1,
+    "triage_category": "quick_fix",
+    "photo_url": None,
+    "formal_description": "",
+    "raw_description": "",
+    "detected_language": "en",
+    "profanity_detected": False,
 }
 
+# Logarithmic cluster boost coefficient.
+# Each natural-log unit of report_count growth adds this many urgency points.
+# With CLUSTER_BOOST_FACTOR = 1.5:
+#   1 report  → +0.00   5 reports → +2.42
+#   2 reports → +1.04  10 reports → +3.45
+#   3 reports → +1.65  20 reports → +4.35
+CLUSTER_BOOST_FACTOR: float = 1.5
 
-def _project_id() -> str:
-    return (
-        os.getenv("GCP_PROJECT_ID")
-        or os.getenv("GOOGLE_CLOUD_PROJECT")
-        or os.getenv("FIREBASE_PROJECT_ID")
-        or ""
-    )
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -72,17 +95,10 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray)):
         return f"<{len(value)} bytes>"
     if isinstance(value, dict):
-        return {key: _json_safe(item) for key, item in value.items()}
+        return {k: _json_safe(v) for k, v in value.items()}
     if isinstance(value, list):
-        return [_json_safe(item) for item in value]
+        return [_json_safe(v) for v in value]
     return value
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -92,18 +108,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _parse_float(value: Any) -> Optional[float]:
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _parse_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -117,12 +131,27 @@ def _extension_for(content_type: str, filename: Optional[str] = None) -> str:
 
 
 def _with_submission_defaults(record: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Backfills any missing fields on a record.
+    Handles both V2 records (new format) and V1 legacy records
+    that predate the clustering and triage features.
+    """
     record.setdefault("status", SUBMISSION_DEFAULTS["status"])
     if record.get("status") == "new":
         record["status"] = SUBMISSION_DEFAULTS["status"]
     record.setdefault("mp_explanation", SUBMISSION_DEFAULTS["mp_explanation"])
     record.setdefault("citizen_review", SUBMISSION_DEFAULTS["citizen_review"])
     record.setdefault("is_archived", SUBMISSION_DEFAULTS["is_archived"])
+    record.setdefault("linked_reports", list(SUBMISSION_DEFAULTS["linked_reports"]))
+    record.setdefault("report_count", SUBMISSION_DEFAULTS["report_count"])
+    record.setdefault("triage_category", SUBMISSION_DEFAULTS["triage_category"])
+    record.setdefault("photo_url", SUBMISSION_DEFAULTS["photo_url"])
+    # Back-fill formal_description from text for V1 legacy records
+    if not record.get("formal_description"):
+        record["formal_description"] = record.get("text", "")
+    record.setdefault("raw_description", record.get("text", ""))
+    record.setdefault("detected_language", SUBMISSION_DEFAULTS["detected_language"])
+    record.setdefault("profanity_detected", SUBMISSION_DEFAULTS["profanity_detected"])
     return record
 
 
@@ -130,8 +159,32 @@ def _is_active_submission(record: Dict[str, Any]) -> bool:
     return not bool(record.get("is_archived"))
 
 
+def _log_cluster_boost(report_count: int) -> float:
+    """
+    Returns the logarithmic urgency boost for a clustered issue.
+
+    Formula: boost = ln(report_count) × CLUSTER_BOOST_FACTOR
+
+    Properties:
+    - Single reports receive zero boost (ln(1) = 0)
+    - Boost grows sub-linearly: doubling the report count does NOT double the boost
+    - This prevents a single highly-reported trivial issue from dominating the priority list
+    - The caller enforces a hard cap of 10.0 on the resulting demand_score
+
+    See CLUSTER_BOOST_FACTOR constant for per-count example values.
+    """
+    n = max(1, _parse_int(report_count, 1))
+    return math.log(n) * CLUSTER_BOOST_FACTOR
+
+
+# ─── Storage Backend ──────────────────────────────────────────────────────────
+
 class StorageBackend:
-    """Offline-first JSON storage for hackathon demos without cloud database billing."""
+    """
+    Offline-first JSON file storage for hackathon demos.
+    All operations are thread-safe via a threading.Lock.
+    No cloud database, no network dependency.
+    """
 
     def __init__(self, path: Path = SUBMISSIONS_FILE) -> None:
         self.path = path
@@ -172,7 +225,7 @@ class StorageBackend:
             with self._lock:
                 rows = self._read_rows()
             rows = [_with_submission_defaults(row) for row in rows]
-            rows.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+            rows.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
             return rows[:limit]
 
         return await run_in_threadpool(_load)
@@ -184,9 +237,9 @@ class StorageBackend:
                 for row in rows:
                     if str(row.get("id")) != submission_id:
                         continue
-
                     _with_submission_defaults(row)
                     row.update(updates)
+                    # Auto-archive when Work Done + citizen review submitted
                     if row.get("status") == "Work Done" and row.get("citizen_review") not in (None, ""):
                         row["is_archived"] = True
                     row["updated_at"] = _now_iso()
@@ -197,18 +250,45 @@ class StorageBackend:
 
         return await run_in_threadpool(_update)
 
+    async def link_report(
+        self,
+        master_id: str,
+        linked_entry: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Append a linked citizen report entry to an existing master issue.
+
+        - Appends the linked_entry to linked_reports[]
+        - Increments report_count = 1 + len(linked_reports)
+        - Persists and returns the updated master record
+        - Returns None if master_id is not found (caller should create a new issue)
+        """
+        def _link() -> Optional[Dict[str, Any]]:
+            with self._lock:
+                rows = self._read_rows()
+                for row in rows:
+                    if str(row.get("id")) != master_id:
+                        continue
+                    _with_submission_defaults(row)
+                    row.setdefault("linked_reports", [])
+                    row["linked_reports"].append(_json_safe(linked_entry))
+                    row["report_count"] = 1 + len(row["linked_reports"])
+                    row["updated_at"] = _now_iso()
+                    self._write_rows(rows)
+                    return row
+            return None
+
+        return await run_in_threadpool(_link)
+
 
 storage_backend = StorageBackend()
 
 
-def _local_media_record(media: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the JSON-safe media metadata saved in data/submissions.json."""
+# ─── Media Handling ───────────────────────────────────────────────────────────
 
-    return {
-        key: value
-        for key, value in media.items()
-        if key != "bytes"
-    }
+def _local_media_record(media: Dict[str, Any]) -> Dict[str, Any]:
+    """Return JSON-safe media metadata, stripping raw bytes before saving."""
+    return {k: v for k, v in media.items() if k != "bytes"}
 
 
 async def save_bytes_to_uploads(
@@ -216,6 +296,11 @@ async def save_bytes_to_uploads(
     content_type: str,
     filename: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Save raw bytes to backend/static/uploads/ and return metadata.
+    The returned `url` field (/static/uploads/<file>) is directly browser-accessible
+    via the /static StaticFiles mount.
+    """
     if not content:
         raise HTTPException(status_code=400, detail="Cannot upload an empty media file.")
 
@@ -224,13 +309,15 @@ async def save_bytes_to_uploads(
     destination = UPLOAD_DIR / unique_filename
     await run_in_threadpool(destination.write_bytes, content)
 
-    relative_path = (Path("data") / "uploads" / unique_filename).as_posix()
+    relative_path = (Path("static") / "uploads" / unique_filename).as_posix()
+    browser_url = f"/static/uploads/{unique_filename}"
     return {
         "bytes": content,
         "mime_type": content_type or "application/octet-stream",
         "filename": unique_filename,
         "original_filename": filename,
-        "path": relative_path,
+        "path": relative_path,          # relative to BASE_DIR, for local disk ops
+        "url": browser_url,             # browser-accessible URL via /static mount
     }
 
 
@@ -268,16 +355,19 @@ async def download_external_media_to_local(media: Dict[str, Any]) -> Dict[str, A
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         response = await client.get(url, auth=auth, headers=headers)
         response.raise_for_status()
-        content_type = media.get("mime_type") or response.headers.get("content-type") or "application/octet-stream"
-        filename = Path(parsed.path).name or None
-        return await save_bytes_to_uploads(response.content, content_type, filename)
+        content_type = (
+            media.get("mime_type")
+            or response.headers.get("content-type")
+            or "application/octet-stream"
+        )
+        fname = Path(parsed.path).name or None
+        return await save_bytes_to_uploads(response.content, content_type, fname)
 
 
 async def resolve_meta_media_url(media_id: str) -> str:
     token = os.getenv("META_WHATSAPP_ACCESS_TOKEN")
     if not token:
         raise HTTPException(status_code=400, detail="Set META_WHATSAPP_ACCESS_TOKEN to resolve Meta media ids.")
-
     graph_version = os.getenv("META_GRAPH_VERSION", "v21.0")
     url = f"https://graph.facebook.com/{graph_version}/{media_id}"
     async with httpx.AsyncClient(timeout=20) as client:
@@ -290,9 +380,13 @@ async def resolve_meta_media_url(media_id: str) -> str:
         return media_url
 
 
+# ─── FastAPI App ──────────────────────────────────────────────────────────────
+
 app = FastAPI(title="People's Priorities API", version="2.0.0")
 
-allowed_origins = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
+allowed_origins = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -305,12 +399,9 @@ app.add_middleware(
 async def require_dashboard_user() -> Dict[str, Any]:
     """
     Offline demo auth shim.
-
     Cloud auth is intentionally bypassed for the hackathon demo so billing or
-    network issues cannot block the MP dashboard. Protected API routes always
-    receive this local mock user.
+    network issues cannot block the MP dashboard.
     """
-
     return {"uid": "local-dev"}
 
 
@@ -342,48 +433,132 @@ async def get_config() -> Dict[str, Any]:
 async def health() -> Dict[str, Any]:
     return {
         "ok": True,
-        "project": _project_id(),
         "storage_file": str(storage_backend.path),
         "upload_dir": str(UPLOAD_DIR),
         "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        "cluster_boost_factor": CLUSTER_BOOST_FACTOR,
+        "version": "2.0.0",
     }
 
+
+# ─── V2.0 Three-Step Intake Pipeline ─────────────────────────────────────────
 
 async def analyze_and_store(
     *,
     channel: str,
-    text: str,
+    raw_text: str,
     media_refs: List[Dict[str, Any]],
-    ward_id: Optional[str] = None,
     address: Optional[str] = None,
     sender: Optional[str] = None,
     raw_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """
+    V2.0 three-step intake pipeline for every new citizen submission.
+
+    ┌─ Step 1: Formalize ──────────────────────────────────────────────────────┐
+    │  Translate regional languages → English                                  │
+    │  Remove profanity, scrub slang → formal professional English             │
+    │  Always succeeds (graceful fallback on Gemini error)                     │
+    └──────────────────────────────────────────────────────────────────────────┘
+    ┌─ Step 2: Deduplicate ────────────────────────────────────────────────────┐
+    │  Compare against up to 20 active issues via Gemini                       │
+    │  Confidence gate: only merge if confidence >= 0.85                       │
+    │  If duplicate → link_report() on master, return merged response          │
+    │  Always succeeds (falls back to creating new issue on error)             │
+    └──────────────────────────────────────────────────────────────────────────┘
+    ┌─ Step 3: Analyze ────────────────────────────────────────────────────────┐
+    │  Full AI analysis: category, triage_category, urgency_score, etc.        │
+    │  Only runs for unique (non-duplicate) new issues                         │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+    citizen_id = str(uuid.uuid4())
+
+    # ── Step 1: Formalize ──────────────────────────────────────────────────────
+    formalization = await run_in_threadpool(formalize_submission, raw_text, media_refs)
+    formal_description = formalization.formal_description
+
+    # ── Step 2: Deduplicate ────────────────────────────────────────────────────
+    all_rows = await storage_backend.load(limit=10000)
+    active_rows = [r for r in all_rows if _is_active_submission(r)]
+
+    dup_result = await run_in_threadpool(
+        check_deduplication,
+        formal_description,
+        address or "",
+        active_rows,
+    )
+
+    if dup_result.is_duplicate and dup_result.master_id:
+        linked_entry: Dict[str, Any] = {
+            "citizen_id": citizen_id,
+            "submitted_at": _now_iso(),
+            "address": address or "",
+            "raw_description": raw_text,
+            "channel": channel,
+        }
+        master = await storage_backend.link_report(dup_result.master_id, linked_entry)
+        if master:
+            return {
+                "merged": True,
+                "id": citizen_id,            # Citizen's personal tracking ID
+                "master_id": dup_result.master_id,
+                "master": master,
+                "message": (
+                    "Your report has been linked to an existing active issue. "
+                    "Use your unique ID below to track the shared status and MP updates."
+                ),
+                "deduplication_confidence": dup_result.confidence,
+            }
+        # Race condition: master was archived between load and link — fall through to new issue
+
+    # ── Step 3: Full Analysis (unique new issue) ───────────────────────────────
     demographics = await run_in_threadpool(
         lambda: fetch_demographics_from_bigquery(constituency_id=os.getenv("CONSTITUENCY_ID"))
     )
     analysis = await run_in_threadpool(
         analyze_submission,
-        text,
+        formal_description,
         media_refs,
         demographics.get("rows", []),
     )
 
-    record = {
-        "id": str(uuid.uuid4()),
+    # Derive browser-accessible photo URL from the first uploaded media ref
+    photo_url: Optional[str] = None
+    for m in media_refs:
+        candidate = m.get("url") or m.get("path", "")
+        if candidate:
+            photo_url = candidate if candidate.startswith("/") else f"/{candidate}"
+            break
+
+    record: Dict[str, Any] = {
+        "id": citizen_id,
         "channel": channel,
         "sender": sender,
-        "text": text,
-        "ward_id": ward_id,
+        # V2 description fields
+        "raw_description": raw_text,
+        "formal_description": formal_description,
+        "detected_language": formalization.detected_language,
+        "profanity_detected": formalization.profanity_detected,
+        "text": formal_description,       # backwards-compat alias for V1 code paths
+        # Location
         "address": address,
-        "media": [_local_media_record(item) for item in media_refs],
+        # Media
+        "photo_url": photo_url,
+        "media": [_local_media_record(m) for m in media_refs],
+        # AI analysis
         "analysis": analysis,
         "category": analysis.get("category"),
+        "triage_category": analysis.get("triage_category", "quick_fix"),
         "urgency_score": analysis.get("urgency_score"),
+        # Clustering
+        "linked_reports": [],
+        "report_count": 1,
+        # Workflow
         "status": SUBMISSION_DEFAULTS["status"],
         "mp_explanation": SUBMISSION_DEFAULTS["mp_explanation"],
         "citizen_review": SUBMISSION_DEFAULTS["citizen_review"],
         "is_archived": SUBMISSION_DEFAULTS["is_archived"],
+        # Metadata
         "demographic_source": demographics.get("source"),
         "created_at": _now_iso(),
         "raw_metadata": raw_metadata or {},
@@ -391,12 +566,13 @@ async def analyze_and_store(
     return await storage_backend.append(record)
 
 
+# ─── Submission Endpoints ─────────────────────────────────────────────────────
+
 @app.post("/api/submissions")
 @app.post("/api/submit")
 async def create_submission(
     request: Request,
     text: str = Form(default=""),
-    ward_id: Optional[str] = Form(default=None),
     address: str = Form(default=""),
     photo: Optional[UploadFile] = File(default=None),
     image: Optional[UploadFile] = File(default=None),
@@ -410,14 +586,13 @@ async def create_submission(
         media_refs.append(uploaded_image)
 
     if not text.strip() and not media_refs:
-        raise HTTPException(status_code=400, detail="Submit text or a photo.")
+        raise HTTPException(status_code=400, detail="Please describe the issue or attach a photo.")
 
     return await analyze_and_store(
         channel="web",
-        text=text.strip(),
+        raw_text=text.strip(),
         media_refs=media_refs,
-        ward_id=ward_id,
-        address=address.strip(),
+        address=address.strip() or None,
         raw_metadata={"client_host": request.client.host if request.client else None},
     )
 
@@ -433,24 +608,62 @@ async def list_submissions(
     return {"items": active_rows[:limit]}
 
 
-@app.post("/api/submissions/{submission_id}/update")
-@app.put("/api/submissions/{submission_id}/update")
-async def update_submission(
-    submission_id: str,
-    request: Request,
-    user: Dict[str, Any] = Depends(require_dashboard_user),
-) -> Dict[str, Any]:
-    del user
+@app.get("/api/submissions/{submission_id}")
+async def get_submission(submission_id: str) -> Dict[str, Any]:
+    """
+    Fetch a single submission by ID — handles both master IDs and linked citizen IDs.
 
+    Resolution order:
+    1. Exact master ID match → returns {item, is_linked: false}
+    2. Linked citizen ID match (inside any master's linked_reports[]) →
+       returns the master issue with {is_linked: true, master_id, linked_entry}
+       so the citizen sees live MP status and explanation.
+    3. Archived issues are still returned (citizens should be able to track closed reports).
+    """
+    rows = await storage_backend.load(limit=10000)
+
+    # 1. Check master IDs
+    for row in rows:
+        if str(row.get("id")) == submission_id:
+            return {"item": row, "is_linked": False}
+
+    # 2. Check linked citizen IDs within each master issue
+    for row in rows:
+        for linked in row.get("linked_reports", []):
+            if str(linked.get("citizen_id")) == submission_id:
+                return {
+                    "item": row,
+                    "is_linked": True,
+                    "master_id": str(row.get("id")),
+                    "linked_entry": linked,
+                }
+
+    raise HTTPException(status_code=404, detail="Submission not found.")
+
+
+async def _read_update_payload(request: Request) -> Dict[str, Any]:
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
-        payload = await request.json()
-    else:
-        payload = dict(await request.form())
+        return await request.json()
+    return dict(await request.form())
 
+
+@app.post("/api/submissions/{submission_id}/mp_update")
+async def mp_update_submission(
+    submission_id: str,
+    request: Request,
+    x_admin_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """
+    MP-only update endpoint. Requires x-admin-key: MP-2026 header.
+    Updating a master issue automatically broadcasts to all linked citizens —
+    they will see the updated status and mp_explanation when they track their ID.
+    """
+    if x_admin_key != ADMIN_PASSKEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing admin passkey.")
+
+    payload = await _read_update_payload(request)
     updates: Dict[str, Any] = {}
-    status_was_updated_to_done = False
-    review_was_submitted = False
 
     if "status" in payload and payload.get("status") not in (None, ""):
         status = str(payload["status"]).strip()
@@ -460,21 +673,15 @@ async def update_submission(
                 detail=f"Invalid status. Use one of: {', '.join(sorted(WORKFLOW_STATUSES))}.",
             )
         updates["status"] = status
-        status_was_updated_to_done = status == "Work Done"
 
     if "mp_explanation" in payload:
-        updates["mp_explanation"] = "" if payload.get("mp_explanation") is None else str(payload["mp_explanation"]).strip()
-
-    if "citizen_review" in payload:
-        raw_review = payload.get("citizen_review")
-        updates["citizen_review"] = None if raw_review in (None, "") else raw_review
-        review_was_submitted = updates["citizen_review"] is not None
+        updates["mp_explanation"] = (
+            "" if payload.get("mp_explanation") is None
+            else str(payload["mp_explanation"]).strip()
+        )
 
     if not updates:
-        raise HTTPException(status_code=400, detail="Submit status, mp_explanation, or citizen_review to update.")
-
-    if status_was_updated_to_done and review_was_submitted:
-        updates["is_archived"] = True
+        raise HTTPException(status_code=400, detail="Provide status or mp_explanation to update.")
 
     updated = await storage_backend.update(submission_id, updates)
     if not updated:
@@ -483,15 +690,28 @@ async def update_submission(
     return {"ok": True, "item": updated}
 
 
+@app.post("/api/submissions/{submission_id}/citizen_review")
+async def citizen_review_submission(
+    submission_id: str,
+    request: Request,
+) -> Dict[str, Any]:
+    payload = await _read_update_payload(request)
+    raw_review = payload.get("citizen_review")
+    if raw_review in (None, ""):
+        raise HTTPException(status_code=400, detail="Provide citizen_review to submit.")
+
+    updates = {"citizen_review": raw_review}
+    updated = await storage_backend.update(submission_id, updates)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Submission not found.")
+
+    return {"ok": True, "item": updated}
+
+
+# ─── Priority Ranking ─────────────────────────────────────────────────────────
+
 def _demographic_index(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {str(row.get("ward_id", "")).lower(): row for row in rows if row.get("ward_id")}
-
-
-def _number(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 @app.get("/api/priorities")
@@ -499,27 +719,71 @@ async def ranked_priorities(
     limit: int = Query(default=500, ge=1, le=1000),
     user: Dict[str, Any] = Depends(require_dashboard_user),
 ) -> Dict[str, Any]:
+    """
+    Returns ranked priority buckets (grouped by ward + civic category) with:
+
+    SCORING FORMULA:
+      base_urgency     = AI urgency score (1–10)
+      cluster_boost    = ln(report_count) × CLUSTER_BOOST_FACTOR
+      effective_urgency= min(base_urgency + cluster_boost, 10.0)   ← hard cap
+      pop_weight       = min(population / 50,000, 4.0)
+      vuln_weight      = min(vulnerability_index / 20, 4.0)
+      demand_score     = min(effective_urgency + pop_weight + vuln_weight, 10.0)  ← hard cap
+
+    Cluster boost is logarithmic so that:
+    - A single-report issue receives zero boost
+    - A 10-report clustered issue gets +3.45 urgency points
+    - A 50-report clustered issue gets +5.77 urgency points
+    - But no issue can exceed demand_score = 10.0
+
+    Response includes:
+    - items: all priority buckets sorted by demand_score desc
+    - by_triage: same buckets grouped by triage_category for frontend tab rendering
+    """
     del user
     submissions = [
         item
         for item in await storage_backend.load(limit=10000)
         if _is_active_submission(item)
     ][:limit]
+
     demographics = await run_in_threadpool(
         lambda: fetch_demographics_from_bigquery(constituency_id=os.getenv("CONSTITUENCY_ID"))
     )
     demo_by_ward = _demographic_index(demographics.get("rows", []))
 
     grouped: Dict[str, Dict[str, Any]] = {}
+    triage_vote: Dict[str, Dict[str, int]] = {}  # key → {triage_category: vote_count}
+
     for item in submissions:
         ward_id = str(item.get("ward_id") or "unknown")
-        category = str(item.get("category") or (item.get("analysis") or {}).get("category") or "other")
+        category = str(
+            item.get("category")
+            or (item.get("analysis") or {}).get("category")
+            or "other"
+        )
+        triage_category = str(item.get("triage_category") or "quick_fix")
         key = f"{ward_id}:{category}"
-        urgency = _number(item.get("urgency_score") or (item.get("analysis") or {}).get("urgency_score"), 1)
+
+        base_urgency = _number(
+            item.get("urgency_score") or (item.get("analysis") or {}).get("urgency_score"),
+            default=1.0,
+        )
+        report_count = _parse_int(item.get("report_count"), 1)
+
+        # Logarithmic cluster boost (capped so urgency never exceeds 10)
+        cluster_boost = _log_cluster_boost(report_count)
+        effective_urgency = min(base_urgency + cluster_boost, 10.0)
+
         demo = demo_by_ward.get(ward_id.lower(), {})
-        population_weight = min(_number(demo.get("population")) / 50000, 4)
-        vulnerability_weight = min(_number(demo.get("vulnerability_index")) / 20, 4)
-        weighted_score = urgency + population_weight + vulnerability_weight
+        population_weight = min(_number(demo.get("population")) / 50_000, 4.0)
+        vulnerability_weight = min(_number(demo.get("vulnerability_index")) / 20.0, 4.0)
+
+        # Total demand score hard-capped at 10.0
+        demand_score = min(
+            effective_urgency + population_weight + vulnerability_weight,
+            10.0,
+        )
 
         bucket = grouped.setdefault(
             key,
@@ -527,25 +791,58 @@ async def ranked_priorities(
                 "ward_id": ward_id,
                 "ward_name": demo.get("ward_name") or ward_id,
                 "category": category,
-                "count": 0,
-                "max_urgency": 0,
+                "triage_category": triage_category,
+                "count": 0,             # distinct master issues in this ward:category bucket
+                "total_reports": 0,     # sum of all report_counts (includes linked citizens)
+                "max_urgency": 0.0,
                 "demand_score": 0.0,
                 "demographics": demo,
                 "latest_summary": "",
             },
         )
-        bucket["count"] += 1
-        bucket["max_urgency"] = max(bucket["max_urgency"], urgency)
-        bucket["demand_score"] += weighted_score
-        bucket["latest_summary"] = (item.get("analysis") or {}).get("summary") or item.get("text") or ""
 
-    priorities = sorted(grouped.values(), key=lambda row: row["demand_score"], reverse=True)
+        bucket["count"] += 1
+        bucket["total_reports"] += report_count
+        bucket["max_urgency"] = round(max(bucket["max_urgency"], effective_urgency), 2)
+        bucket["demand_score"] = round(max(bucket["demand_score"], demand_score), 2)
+        bucket["latest_summary"] = (
+            (item.get("analysis") or {}).get("summary")
+            or item.get("formal_description")
+            or item.get("text")
+            or ""
+        )
+
+        # Vote for dominant triage_category in this bucket
+        votes = triage_vote.setdefault(key, {})
+        votes[triage_category] = votes.get(triage_category, 0) + 1
+
+    # Assign dominant triage_category to each bucket by plurality vote
+    for key, bucket in grouped.items():
+        votes = triage_vote.get(key, {})
+        if votes:
+            bucket["triage_category"] = max(votes, key=votes.__getitem__)
+
+    priorities = sorted(grouped.values(), key=lambda r: r["demand_score"], reverse=True)
+
+    # Build triage-grouped convenience dict for frontend tab rendering
+    by_triage: Dict[str, List[Dict[str, Any]]] = {
+        "quick_fix": [],
+        "urgent_infrastructure": [],
+        "long_term_planning": [],
+    }
+    for p in priorities:
+        tc = p.get("triage_category", "quick_fix")
+        by_triage.setdefault(tc, []).append(p)
+
     return {
         "items": priorities,
+        "by_triage": by_triage,
         "demographics_source": demographics.get("source"),
         "demographics_query": demographics.get("query"),
     }
 
+
+# ─── WhatsApp Webhook ─────────────────────────────────────────────────────────
 
 async def _read_webhook_payload(request: Request) -> Dict[str, Any]:
     content_type = request.headers.get("content-type", "")
@@ -562,7 +859,6 @@ def _extract_twilio_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         mime_type = payload.get(f"MediaContentType{index}") or "application/octet-stream"
         if url and not mime_type.startswith("audio/"):
             media.append({"provider": "twilio", "url": url, "mime_type": mime_type})
-
     return {
         "sender": payload.get("From") or payload.get("WaId"),
         "text": payload.get("Body", ""),
@@ -593,47 +889,41 @@ def _extract_meta_messages(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 msg_type = message.get("type")
                 text = ""
                 media: List[Dict[str, Any]] = []
-
                 if msg_type == "text":
                     text = (message.get("text") or {}).get("body", "")
                 elif msg_type in {"image", "document"}:
                     media_item = _media_from_meta(message, msg_type)
                     if media_item:
                         media.append(media_item)
-
                 location = message.get("location") or {}
-                extracted.append(
-                    {
-                        "sender": message.get("from"),
-                        "text": text,
-                        "address": location.get("address") or location.get("name") or "",
-                        "media": media,
-                        "raw": message,
-                    }
-                )
+                extracted.append({
+                    "sender": message.get("from"),
+                    "text": text,
+                    "address": location.get("address") or location.get("name") or "",
+                    "media": media,
+                    "raw": message,
+                })
     return extracted
 
 
 def _extract_mock_messages(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if "messages" in payload and isinstance(payload["messages"], list):
-        messages = payload["messages"]
-    else:
-        messages = [payload]
-
+    messages = (
+        payload.get("messages")
+        if isinstance(payload.get("messages"), list)
+        else [payload]
+    )
     extracted = []
     for message in messages:
         media = message.get("media", [])
         if isinstance(media, dict):
             media = [media]
-        extracted.append(
-            {
-                "sender": message.get("from") or message.get("sender"),
-                "text": message.get("text") or message.get("body") or "",
-                "address": message.get("address", ""),
-                "media": media,
-                "raw": message,
-            }
-        )
+        extracted.append({
+            "sender": message.get("from") or message.get("sender"),
+            "text": message.get("text") or message.get("body") or "",
+            "address": message.get("address", ""),
+            "media": media,
+            "raw": message,
+        })
     return extracted
 
 
@@ -650,9 +940,12 @@ async def load_existing_local_media(media: Dict[str, Any]) -> Dict[str, Any]:
     file_path = raw_path if raw_path.is_absolute() else BASE_DIR / raw_path
     if not file_path.exists():
         raise HTTPException(status_code=400, detail=f"Local media path not found: {media['path']}")
-
     content = await run_in_threadpool(file_path.read_bytes)
-    mime_type = media.get("mime_type") or mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    mime_type = (
+        media.get("mime_type")
+        or mimetypes.guess_type(file_path.name)[0]
+        or "application/octet-stream"
+    )
     try:
         relative_path = file_path.relative_to(BASE_DIR).as_posix()
     except ValueError:
@@ -663,6 +956,7 @@ async def load_existing_local_media(media: Dict[str, Any]) -> Dict[str, Any]:
         "filename": file_path.name,
         "original_filename": media.get("filename") or file_path.name,
         "path": relative_path,
+        "url": f"/{relative_path}",
     }
 
 
@@ -689,9 +983,9 @@ async def whatsapp_webhook(request: Request) -> Dict[str, Any]:
         saved.append(
             await analyze_and_store(
                 channel="whatsapp",
-                text=str(message.get("text") or "").strip(),
+                raw_text=str(message.get("text") or "").strip(),
                 media_refs=media_refs,
-                address=str(message.get("address") or "").strip(),
+                address=str(message.get("address") or "").strip() or None,
                 sender=message.get("sender"),
                 raw_metadata=message.get("raw"),
             )
@@ -700,19 +994,28 @@ async def whatsapp_webhook(request: Request) -> Dict[str, Any]:
     return {"ok": True, "saved": saved}
 
 
-# Register static frontend serving after API routes so /api/* endpoints keep
-# priority, while /config.js, assets, and other frontend files resolve normally.
+# ─── Static File Serving ──────────────────────────────────────────────────────
+
+# /static → backend/static/ (serves uploaded images at /static/uploads/<file>)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# / → frontend/ (must be LAST — after all API routes and the /static mount)
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
 
 
+# ─── Dev Server Entry Point ───────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import socket
-
     import uvicorn
 
     def _find_available_port(bind_host: str, preferred_port: int, attempts: int = 25) -> int:
         for candidate in range(preferred_port, preferred_port + attempts):
-            family = socket.AF_INET6 if ":" in bind_host and bind_host != "0.0.0.0" else socket.AF_INET
+            family = (
+                socket.AF_INET6
+                if ":" in bind_host and bind_host != "0.0.0.0"
+                else socket.AF_INET
+            )
             with socket.socket(family, socket.SOCK_STREAM) as sock:
                 try:
                     sock.bind((bind_host, candidate))
@@ -726,6 +1029,6 @@ if __name__ == "__main__":
     port = _find_available_port(host, requested_port)
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     if port != requested_port:
-        print(f"Port {requested_port} is busy; using {port} instead.")
-    print(f"People's Priorities API running at http://{display_host}:{port}")
+        print(f"Port {requested_port} busy — using {port} instead.")
+    print(f"People's Priorities V2.0 → http://{display_host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level=os.getenv("LOG_LEVEL", "info"))
