@@ -167,7 +167,7 @@
 
     .dashboard {
       display: grid;
-      grid-template-columns: minmax(320px, 400px) minmax(0, 1fr);
+      grid-template-columns: minmax(320px, 620px) minmax(0, 1fr);
       min-height: calc(100vh - 60px);
     }
 
@@ -917,7 +917,7 @@
           </details>` : ""}
           ${address}
           <div class="row meta">
-            <span>${escapeHtml(item.channel || "web")}</span>
+            <span>${escapeHtml(item.channel || "Date of Submission Form")}</span>
             ${clusterInfo}
           </div>
           ${explanation ? `<div class="meta"><strong>MP Update:</strong> ${escapeHtml(explanation)}</div>` : ""}

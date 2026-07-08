@@ -221,7 +221,7 @@
 
     .dashboard {
       display: grid;
-      grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+      grid-template-columns: minmax(300px, 620px) minmax(0, 1fr);
       min-height: calc(100vh - 60px);
     }
 
@@ -1004,7 +1004,7 @@
           <strong style="font-size:0.92rem;line-height:1.4">${escapeHtml(summary)}</strong>
           ${rawDescBlock}
           ${address}
-          <div class="meta">${escapeHtml(item.channel || "web")} · ${new Date(item.created_at || Date.now()).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}</div>
+          <div class="meta">${escapeHtml(item.channel || "Date of Submission Form")} · ${new Date(item.created_at || Date.now()).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}</div>
 
           ${explanation ? `<div class="meta" style="border-left:3px solid var(--brand);padding-left:8px"><strong>MP Update:</strong> ${escapeHtml(explanation)}</div>` : ""}
           ${linkedList}

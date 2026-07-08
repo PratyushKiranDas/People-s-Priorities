@@ -589,7 +589,7 @@ async def create_submission(
         raise HTTPException(status_code=400, detail="Please describe the issue or attach a photo.")
 
     return await analyze_and_store(
-        channel="web",
+        channel="Date of Submission Form",
         raw_text=text.strip(),
         media_refs=media_refs,
         address=address.strip() or None,
