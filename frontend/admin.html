@@ -620,7 +620,7 @@
           MP Passkey
           <input id="admin-passkey" name="admin_passkey" type="password"
             autocomplete="current-password"
-            placeholder="Enter your secure access code">
+            placeholder="Enter your secure access code(MP-2026)">
         </label>
         <span id="login-status" class="status" style="text-align:center"></span>
         <button type="submit" class="login-submit">Unlock Dashboard</button>
@@ -818,11 +818,20 @@
   function updateStats(submissions) {
     const total    = submissions.length;
     const citizens = submissions.reduce((s, r) => s + (r.report_count || 1), 0);
-    const urgent   = submissions.filter((r) => r.triage_category === "urgent_infrastructure").length;
+    // DEMO UPGRADE: Combine both emergencies AND urgent infrastructure into one critical stat
+    const urgent   = submissions.filter((r) => 
+      r.triage_category === "urgent_infrastructure" || 
+      r.triage_category === "critical_emergency"
+    ).length;
     const done     = submissions.filter((r) => r.status === "Work Done").length;
+    
     statTotal.textContent   = total;
     statCitizens.textContent = citizens;
     statUrgent.textContent  = urgent;
+    
+    // Add a red warning color if there are any urgent/emergency issues
+    statUrgent.style.color = urgent > 0 ? "var(--danger)" : "var(--admin-accent)";
+    
     statDone.textContent    = done;
   }
 
@@ -1121,14 +1130,43 @@
         status: fd.get("status"),
         mp_explanation: fd.get("mp_explanation"),
       });
+      
+      // DEMO UPGRADE: Visual success flash on the specific card
+      const card = updateForm.closest('.submission-item');
+      card.style.transition = "all 0.3s";
+      card.style.backgroundColor = "var(--good-light)";
+      card.style.borderColor = "var(--good)";
+      submitBtn.textContent = "✓ Saved";
+      submitBtn.style.backgroundColor = "var(--good)";
+      
       setStatus(dashboardStatus, "✓ Submission updated — broadcast to all linked citizens.", "good");
-      await refreshDashboard();
+      
+      // Wait 1 second so the user sees the green flash before refreshing the board
+      setTimeout(async () => {
+        await refreshDashboard();
+      }, 1000);
+
     } catch (err) {
       setStatus(dashboardStatus, err.message, "error");
       submitBtn.disabled = false;
       submitBtn.textContent = originalText;
     }
   });
+
+  /* ── Auto-Refresh (Live Command Center) ─────────────────────────────────── */
+  setInterval(async () => {
+    // Only auto-refresh if the MP is actively logged in
+    if (storedPasskey && !adminDashboard.hidden) {
+      // Check if the user is currently typing in an input box so we don't interrupt them
+      const activeElement = document.activeElement;
+      const isTyping = activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA';
+      
+      if (!isTyping) {
+        try { await refreshDashboard(); } catch (e) { console.error("Auto-refresh failed", e); }
+      }
+    }
+  }, 15000); // Polls every 15 seconds
+
 </script>
 </body>
 </html>

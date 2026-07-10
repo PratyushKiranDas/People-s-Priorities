@@ -1047,20 +1047,34 @@
       setStatus(submitStatus, "Geolocation not supported.", "error");
       return;
     }
-    setStatus(submitStatus, "Getting location…", "info");
+    
+    // Visual feedback on the button itself
+    const originalText = useLocationBtn.innerHTML;
+    useLocationBtn.innerHTML = "⏳ Locating...";
+    useLocationBtn.disabled = true;
+    setStatus(submitStatus, "Finding your exact coordinates…", "info");
+    
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         const { latitude, longitude } = pos.coords;
         intakeForm.address.value = `GPS: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
-        setStatus(submitStatus, "Location filled ✓", "good");
+        setStatus(submitStatus, "Location captured ✓", "good");
+        useLocationBtn.innerHTML = "✅ Location Added";
+        setTimeout(() => { 
+          useLocationBtn.innerHTML = originalText; 
+          useLocationBtn.disabled = false;
+        }, 3000);
       },
       () => {
-        intakeForm.address.value = "Location unavailable — please type your address";
-        setStatus(submitStatus, "Could not get precise location.", "error");
-      }
+        intakeForm.address.value = "";
+        setStatus(submitStatus, "Could not get precise location. Please type it.", "error");
+        useLocationBtn.innerHTML = originalText;
+        useLocationBtn.disabled = false;
+      },
+      { timeout: 10000 } // Give up after 10 seconds to prevent infinite hanging
     );
   });
-
+  
   intakeForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     submitResult.hidden = true;
@@ -1125,6 +1139,15 @@
   try {
     await loadConfig();
     await refreshDashboard();
+    
+    // DEMO UPGRADE: Auto-refresh the dashboard silently every 15 seconds
+    setInterval(async () => {
+      // Only refresh if the user isn't actively typing in the search box
+      if (document.activeElement !== trackingForm.search_id) {
+        await refreshDashboard();
+      }
+    }, 15000);
+    
   } catch (err) {
     setStatus(dashboardStatus, err.message, "error");
   }

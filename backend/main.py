@@ -50,7 +50,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-ADMIN_PASSKEY = "MP-2026"
+ADMIN_PASSKEY = os.getenv("ADMIN_PASSKEY", "MP-2026")
 
 WORKFLOW_STATUSES = {
     "Noticed by Government",
@@ -303,6 +303,16 @@ async def save_bytes_to_uploads(
     """
     if not content:
         raise HTTPException(status_code=400, detail="Cannot upload an empty media file.")
+
+    # --- SECURITY PATCH: File Type & Size Validation ---
+    # Enforce a 5MB file size limit (5 * 1024 * 1024 bytes)
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File is too large. Please upload an image under 5MB.")
+    
+    # Ensure the file is actually an image
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Unsupported file type. Please upload a valid image file.")
+    # ---------------------------------------------------
 
     extension = _extension_for(content_type, filename)
     unique_filename = f"{uuid.uuid4().hex}{extension}"

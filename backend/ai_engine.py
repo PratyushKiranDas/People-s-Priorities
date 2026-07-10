@@ -201,6 +201,7 @@ EXAMPLES OF PROFANITY HANDLING:
 • DO NOT minimize or exaggerate the severity
 • Set profanity_detected=true if ANY profanity or offensive language was present in the original
 • Detect and report the primary language code used
+• IMAGE-ONLY SUBMISSIONS: If the user provides an image/photo with little or no text, you MUST act as an expert visual inspector. Analyze the image and generate a highly detailed, formal English description of the civic issue you see (e.g., 'The image shows a large unpaved pothole approximately 2 feet wide on a residential street with water accumulation.').
 
 Output ONLY the structured JSON. No preamble, no explanation.
 """
@@ -523,17 +524,17 @@ def _local_fallback_analysis(text: str) -> Dict[str, Any]:
     # Any of these keywords indicate an immediate danger to human life.
     emergency_keywords = [
         "dead body", "found dead", "dead man", "dead woman", "dead child",
-        "dead", "death", "died", "corpse", "body found",
-        "collapse", "collapsed", "collapsing", "building fell", "structure fell",
-        "accident", "road accident", "car crash", "vehicle crash", "bike crash",
-        "fire", "burning", "on fire",
+        "dead", "death", "died", "corpse", "body found", "lash", "maut", "margaya",
+        "collapse", "collapsed", "collapsing", "building fell", "structure fell","gir gaya",
+        "accident", "road accident", "car crash", "vehicle crash", "bike crash", "durghatna",
+        "fire", "burning", "on fire","aag", "aag lag",
         "gas leak", "gas cylinder", "lpg leak",
-        "explosion", "blast",
-        "injured", "serious injury", "critical condition",
-        "drowning", "drowned",
-        "murder", "killed", "stabbed", "shot",
-        "trapped", "rescue needed", "missing person",
-        "electrocuted", "electric shock",
+        "explosion", "blast","dhamaka",
+        "injured", "serious injury", "critical condition","ghayal",
+        "drowning", "drowned", "doob",
+        "murder", "killed", "stabbed", "shot","khoon", "maardia",
+        "trapped", "rescue needed", "missing person","phas gaya",
+        "electrocuted", "electric shock", "current lag",
     ]
     if any(w in lowered for w in emergency_keywords):
         summary = text.strip()[:180] or "Critical emergency reported."
@@ -572,11 +573,11 @@ def _local_fallback_analysis(text: str) -> Dict[str, Any]:
     ]
     # ── Tier 2: urgent_infrastructure — existing service failures ────────
     urgent_words = [
-        "burst pipe", "burst water", "flooding", "flood", "sewer",
-        "sewage overflow", "power grid", "blackout", "grid failure",
-        "power failure", "no water supply", "water contamination",
+        "burst pipe", "burst water", "flooding", "flood", "sewer", "pani bhar", "baadh",
+        "sewage overflow", "power grid", "blackout", "grid failure", "andhera",
+        "power failure", "no water supply", "water contamination", "pani nahi", "ganda pani",
         "structural damage", "damaged bridge", "hospital shortage",
-        "broken sewer", "no electricity", "transformer failure",
+        "broken sewer", "no electricity", "transformer failure", "batti gul", "bijli",
     ]
 
     # ── Standard keyword triage (Tier 1 > Tier 2 > Tier 3) ──────────────
